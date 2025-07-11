@@ -1,4 +1,4 @@
-// Example code for interacting with serial_irq.c via TCP (Multi-threaded - Simple)
+// Example code for interacting with serial_irq.c via TCP (Multi-threaded - No Select)
 //
 // Copyright (C) 2018  Kevin O'Connor <kevin@koconnor.net>
 //
@@ -21,23 +21,22 @@
 // Global variables
 static int server_fd = -1;
 static int client_fd = -1;
-static pthread_t tcp_thread;
-static volatile int tcp_thread_running = 0;
+static pthread_t accept_thread;
+static pthread_t read_thread;
+static pthread_t write_thread;
+static volatile int threads_running = 0;
 static volatile int shutdown_requested = 0;
 static pthread_mutex_t client_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static void* tcp_thread_func(void* arg)
+// Accept thread - handles new connections
+static void* accept_thread_func(void* arg)
 {
-    (void)arg; // Unused parameter
+    (void)arg;
     struct sockaddr_in address;
     int opt = 1;
     
-    // Ignore SIGPIPE
-    signal(SIGPIPE, SIG_IGN);
-    
     // Create and setup server socket
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        tcp_thread_running = 0;
         return NULL;
     }
     
@@ -52,31 +51,21 @@ static void* tcp_thread_func(void* arg)
         listen(server_fd, 1) < 0) {
         close(server_fd);
         server_fd = -1;
-        tcp_thread_running = 0;
         return NULL;
     }
     
-    tcp_thread_running = 1;
+    threads_running = 1;
     
-    // Main TCP loop
+    // Accept connections loop
     while (!shutdown_requested) {
-        // Accept new connection
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         
-        fd_set read_fds;
-        struct timeval timeout;
-        FD_ZERO(&read_fds);
-        FD_SET(server_fd, &read_fds);
-        timeout.tv_sec = 1;
-        timeout.tv_usec = 0;
-        
-        if (select(server_fd + 1, &read_fds, NULL, NULL, &timeout) <= 0) {
-            continue;
-        }
-        
         int new_client = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (new_client < 0) {
+            if (!shutdown_requested) {
+                usleep(100000); // Wait 100ms on error
+            }
             continue;
         }
         
@@ -86,49 +75,6 @@ static void* tcp_thread_func(void* arg)
         }
         client_fd = new_client;
         pthread_mutex_unlock(&client_mutex);
-        
-        // Handle client communication
-        uint8_t buffer[256];
-        while (!shutdown_requested) {
-            fd_set fds;
-            FD_ZERO(&fds);
-            FD_SET(client_fd, &fds);
-            timeout.tv_sec = 0;
-            timeout.tv_usec = 100000; // 100ms
-            
-            int activity = select(client_fd + 1, &fds, NULL, NULL, &timeout);
-            
-            if (activity < 0) {
-                break; // Error
-            }
-            
-            // Handle incoming data
-            if (activity > 0 && FD_ISSET(client_fd, &fds)) {
-                ssize_t bytes = read(client_fd, buffer, sizeof(buffer));
-                if (bytes <= 0) {
-                    break; // Client disconnected
-                }
-                
-                // Process received data directly
-                for (ssize_t i = 0; i < bytes; i++) {
-                    serial_rx_byte(buffer[i]);
-                }
-            }
-            
-            // Handle outgoing data
-            uint8_t tx_data;
-            while (serial_get_tx_byte(&tx_data) == 0) {
-                if (write(client_fd, &tx_data, 1) <= 0) {
-                    goto client_disconnected;
-                }
-            }
-        }
-        
-        client_disconnected:
-        pthread_mutex_lock(&client_mutex);
-        close(client_fd);
-        client_fd = -1;
-        pthread_mutex_unlock(&client_mutex);
     }
     
     // Cleanup
@@ -136,22 +82,88 @@ static void* tcp_thread_func(void* arg)
         close(server_fd);
         server_fd = -1;
     }
-    pthread_mutex_lock(&client_mutex);
-    if (client_fd != -1) {
-        close(client_fd);
-        client_fd = -1;
-    }
-    pthread_mutex_unlock(&client_mutex);
+    return NULL;
+}
+
+// Read thread - handles incoming data
+static void* read_thread_func(void* arg)
+{
+    (void)arg;
+    uint8_t buffer[256];
     
-    tcp_thread_running = 0;
+    while (!shutdown_requested) {
+        pthread_mutex_lock(&client_mutex);
+        int current_client = client_fd;
+        pthread_mutex_unlock(&client_mutex);
+        
+        if (current_client == -1) {
+            usleep(100000); // Wait 100ms if no client
+            continue;
+        }
+        
+        ssize_t bytes = read(current_client, buffer, sizeof(buffer));
+        if (bytes > 0) {
+            // Process received data
+            for (ssize_t i = 0; i < bytes; i++) {
+                serial_rx_byte(buffer[i]);
+            }
+        } else {
+            // Client disconnected or error
+            pthread_mutex_lock(&client_mutex);
+            if (client_fd == current_client) {
+                close(client_fd);
+                client_fd = -1;
+            }
+            pthread_mutex_unlock(&client_mutex);
+        }
+    }
+    return NULL;
+}
+
+// Write thread - handles outgoing data
+static void* write_thread_func(void* arg)
+{
+    (void)arg;
+    
+    while (!shutdown_requested) {
+        pthread_mutex_lock(&client_mutex);
+        int current_client = client_fd;
+        pthread_mutex_unlock(&client_mutex);
+        
+        if (current_client == -1) {
+            usleep(10000); // Wait 10ms if no client
+            continue;
+        }
+        
+        uint8_t data;
+        if (serial_get_tx_byte(&data) == 0) {
+            if (write(current_client, &data, 1) <= 0) {
+                // Client disconnected or error
+                pthread_mutex_lock(&client_mutex);
+                if (client_fd == current_client) {
+                    close(client_fd);
+                    client_fd = -1;
+                }
+                pthread_mutex_unlock(&client_mutex);
+            }
+        } else {
+            usleep(1000); // Wait 1ms if no data to send
+        }
+    }
     return NULL;
 }
 
 void
 serial_init(void)
 {
+    signal(SIGPIPE, SIG_IGN);
     shutdown_requested = 0;
-    pthread_create(&tcp_thread, NULL, tcp_thread_func, NULL);
+    client_fd = -1;
+    
+    // Start all threads
+    pthread_create(&accept_thread, NULL, accept_thread_func, NULL);
+    pthread_create(&read_thread, NULL, read_thread_func, NULL);
+    pthread_create(&write_thread, NULL, write_thread_func, NULL);
 }
 DECL_INIT(serial_init);
 
@@ -164,15 +176,32 @@ console_receive_buffer(void)
 void
 serial_enable_tx_irq(void)
 {
-    // In this simple version, the TCP thread handles all TX data directly
-    // This function is called by the main thread but TX is handled in TCP thread
+    // Write thread handles all TX data automatically
 }
 
 void
 serial_cleanup(void)
 {
     shutdown_requested = 1;
-    if (tcp_thread_running) {
-        pthread_join(tcp_thread, NULL);
+    
+    // Close server socket to unblock accept
+    if (server_fd != -1) {
+        close(server_fd);
+        server_fd = -1;
+    }
+    
+    // Close client socket
+    pthread_mutex_lock(&client_mutex);
+    if (client_fd != -1) {
+        close(client_fd);
+        client_fd = -1;
+    }
+    pthread_mutex_unlock(&client_mutex);
+    
+    // Wait for threads to finish
+    if (threads_running) {
+        pthread_join(accept_thread, NULL);
+        pthread_join(read_thread, NULL);
+        pthread_join(write_thread, NULL);
     }
 }

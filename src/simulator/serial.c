@@ -1,4 +1,4 @@
-// Example code for interacting with serial_irq.c via TCP (Multi-threaded - No Select)
+// Example code for interacting with serial_irq.c via TCP (Multi-threaded - Direct Send)
 //
 // Copyright (C) 2018  Kevin O'Connor <kevin@koconnor.net>
 //
@@ -23,7 +23,6 @@ static int server_fd = -1;
 static int client_fd = -1;
 static pthread_t accept_thread;
 static pthread_t read_thread;
-static pthread_t write_thread;
 static volatile int threads_running = 0;
 static volatile int shutdown_requested = 0;
 static pthread_mutex_t client_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -120,39 +119,6 @@ static void* read_thread_func(void* arg)
     return NULL;
 }
 
-// Write thread - handles outgoing data
-static void* write_thread_func(void* arg)
-{
-    (void)arg;
-    
-    while (!shutdown_requested) {
-        pthread_mutex_lock(&client_mutex);
-        int current_client = client_fd;
-        pthread_mutex_unlock(&client_mutex);
-        
-        if (current_client == -1) {
-            usleep(10000); // Wait 10ms if no client
-            continue;
-        }
-        
-        uint8_t data;
-        if (serial_get_tx_byte(&data) == 0) {
-            if (write(current_client, &data, 1) <= 0) {
-                // Client disconnected or error
-                pthread_mutex_lock(&client_mutex);
-                if (client_fd == current_client) {
-                    close(client_fd);
-                    client_fd = -1;
-                }
-                pthread_mutex_unlock(&client_mutex);
-            }
-        } else {
-            usleep(1000); // Wait 1ms if no data to send
-        }
-    }
-    return NULL;
-}
-
 void
 serial_init(void)
 {
@@ -160,10 +126,9 @@ serial_init(void)
     shutdown_requested = 0;
     client_fd = -1;
     
-    // Start all threads
+    // Start threads
     pthread_create(&accept_thread, NULL, accept_thread_func, NULL);
     pthread_create(&read_thread, NULL, read_thread_func, NULL);
-    pthread_create(&write_thread, NULL, write_thread_func, NULL);
 }
 DECL_INIT(serial_init);
 
@@ -176,7 +141,26 @@ console_receive_buffer(void)
 void
 serial_enable_tx_irq(void)
 {
-    // Write thread handles all TX data automatically
+    // Send data directly in main thread
+    pthread_mutex_lock(&client_mutex);
+    int current_client = client_fd;
+    pthread_mutex_unlock(&client_mutex);
+    
+    if (current_client != -1) {
+        uint8_t data;
+        while (serial_get_tx_byte(&data) == 0) {
+            if (write(current_client, &data, 1) <= 0) {
+                // Client disconnected or error
+                pthread_mutex_lock(&client_mutex);
+                if (client_fd == current_client) {
+                    close(client_fd);
+                    client_fd = -1;
+                }
+                pthread_mutex_unlock(&client_mutex);
+                break;
+            }
+        }
+    }
 }
 
 void
@@ -202,6 +186,5 @@ serial_cleanup(void)
     if (threads_running) {
         pthread_join(accept_thread, NULL);
         pthread_join(read_thread, NULL);
-        pthread_join(write_thread, NULL);
     }
 }

@@ -123,7 +123,7 @@ timer_read_time(void)
 void
 timer_kick(void)
 {
-    TimerInfo.must_wake_timers = 1;
+    timer_dispatch();
 }
 
 #define TIMER_IDLE_REPEAT_COUNT 100

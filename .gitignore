@@ -4,3 +4,8 @@ out
 .config
 .config.old
 klippy/.version
+
+# Development environment
+klippy-env/
+printer.cfg.bak
+.vscode/settings.json

@@ -1,0 +1,82 @@
+{
+    "name": "Klipper Development",
+    "image": "mcr.microsoft.com/devcontainers/ubuntu:22.04",
+    
+    "features": {
+        "ghcr.io/devcontainers/features/common-utils:2": {
+            "installZsh": true,
+            "configureZshAsDefaultShell": true,
+            "installOhMyZsh": true,
+            "upgradePackages": true,
+            "username": "vscode",
+            "userUid": "1000",
+            "userGid": "1000"
+        },
+        "ghcr.io/devcontainers/features/python:1": {
+            "version": "3.11",
+            "installTools": true,
+            "enableShared": true
+        },
+        "ghcr.io/devcontainers/features/git:1": {
+            "ppa": true,
+            "version": "latest"
+        }
+    },
+
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.pylint",
+                "ms-python.flake8",
+                "ms-vscode.cpptools",
+                "ms-vscode.cmake-tools",
+                "ms-vscode.makefile-tools",
+                "redhat.vscode-yaml",
+                "ms-vscode.vscode-json",
+                "tamasfe.even-better-toml",
+                "ms-python.debugpy",
+                "ms-vscode.hexdump"
+            ],
+            "settings": {
+                "python.defaultInterpreterPath": "/workspaces/klipper/klippy-env/bin/python",
+                "python.terminal.activateEnvironment": true,
+                "python.linting.enabled": true,
+                "python.linting.pylintEnabled": true,
+                "python.formatting.provider": "black",
+                "files.associations": {
+                    "*.cfg": "ini",
+                    "*.config": "kconfig"
+                },
+                "terminal.integrated.defaultProfile.linux": "zsh"
+            }
+        }
+    },
+
+    "onCreateCommand": "bash .devcontainer/setup.sh",
+    
+    "postCreateCommand": "echo 'Klipper development environment ready!'",
+
+    "remoteUser": "vscode",
+
+    "mounts": [
+        "source=/dev,target=/dev,type=bind"
+    ],
+
+    "privileged": true,
+
+    "forwardPorts": [8080, 7125],
+
+    "portsAttributes": {
+        "8080": {
+            "label": "Mainsail/Fluidd Web Interface",
+            "onAutoForward": "notify"
+        },
+        "7125": {
+            "label": "Moonraker API",
+            "onAutoForward": "notify"
+        }
+    },
+
+    "workspaceFolder": "/workspaces/klipper"
+}

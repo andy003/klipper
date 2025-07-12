@@ -7,4 +7,4 @@ src-y += generic/crc16_ccitt.c generic/alloc.c
 src-y += generic/timer_irq.c generic/serial_irq.c
 
 # Add pthread library for multi-threaded TCP support
-CFLAGS_klipper.elf += -lpthread
+CFLAGS_klipper.elf += -lpthread -levent

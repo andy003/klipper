@@ -1,4 +1,4 @@
-// Handling of timers in simulator environment (based on Linux timer implementation)
+// Handling of timers in simulator environment (using libevent)
 //
 // Copyright (C) 2017-2021  Kevin O'Connor <kevin@koconnor.net>
 //
@@ -7,6 +7,9 @@
 #include <time.h> // struct timespec
 #include <signal.h> // signal handling
 #include <unistd.h> // usleep
+#include <event2/event.h> // libevent
+#include <event2/event_struct.h> // libevent structures
+#include <sys/time.h> // gettimeofday
 #include "autoconf.h" // CONFIG_CLOCK_FREQ
 #include "board/irq.h" // irq_disable
 #include "board/misc.h" // timer_from_us
@@ -16,20 +19,13 @@
 #include "sched.h" // DECL_INIT
 
 // Global storage for timer handling
-static struct {
-    // Last time reported by timer_read_time()
-    uint32_t last_read_time;
-    // Fields for converting from a systime to ticks
-    time_t start_sec;
-    // Flags for tracking irq_enable()/irq_disable()
-    uint32_t must_wake_timers;
-    // Time of next software timer (also used to convert from ticks to systime)
-    uint32_t next_wake_counter;
-    struct timespec next_wake;
-    // Unix signal tracking
-    timer_t t_alarm;
-    sigset_t ss_alarm, ss_sleep;
-} TimerInfo;
+static uint32_t last_read_time;
+static time_t start_sec;
+static struct event_base *event_base;
+static struct event *timer_event;
+static uint32_t must_wake_timers;
+static uint32_t next_wake_counter;
+static struct timespec next_wake;
 
 #define NSECS 1000000000LL
 #define NSECS_PER_TICK (NSECS / CONFIG_CLOCK_FREQ)
@@ -43,7 +39,7 @@ static struct {
 static inline uint32_t
 timespec_to_time(struct timespec ts)
 {
-    return ((ts.tv_sec - TimerInfo.start_sec) * CONFIG_CLOCK_FREQ
+    return ((ts.tv_sec - start_sec) * CONFIG_CLOCK_FREQ
             + ts.tv_nsec / NSECS_PER_TICK);
 }
 
@@ -51,10 +47,10 @@ timespec_to_time(struct timespec ts)
 static inline struct timespec
 timespec_from_time(uint32_t time)
 {
-    int32_t counter_diff = time - TimerInfo.next_wake_counter;
+    int32_t counter_diff = time - next_wake_counter;
     struct timespec ts;
-    ts.tv_sec = TimerInfo.next_wake.tv_sec;
-    ts.tv_nsec = TimerInfo.next_wake.tv_nsec + counter_diff * NSECS_PER_TICK;
+    ts.tv_sec = next_wake.tv_sec;
+    ts.tv_nsec = next_wake.tv_nsec + counter_diff * NSECS_PER_TICK;
     if ((unsigned long)ts.tv_nsec >= NSECS) {
         if (ts.tv_nsec < 0) {
             ts.tv_sec--;
@@ -76,6 +72,15 @@ timespec_read(void)
     return ts;
 }
 
+// Convert timespec to timeval for libevent
+static inline struct timeval
+timespec_to_timeval(struct timespec ts)
+{
+    struct timeval tv;
+    tv.tv_sec = ts.tv_sec;
+    tv.tv_usec = ts.tv_nsec / 1000;
+    return tv;
+}
 
 /****************************************************************
  * Timers
@@ -87,27 +92,11 @@ DECL_CONSTANT("CLOCK_FREQ", CONFIG_CLOCK_FREQ);
 int
 timer_check_periodic(uint32_t *ts)
 {
-    uint32_t lrt = TimerInfo.last_read_time;
+    uint32_t lrt = last_read_time;
     if (timer_is_before(lrt, *ts))
         return 0;
     *ts = lrt + timer_from_us(2000000);
     return 1;
-}
-
-// Return the number of clock ticks for a given number of microseconds
-uint32_t
-timer_from_us(uint32_t us)
-{
-    return us * (CONFIG_CLOCK_FREQ / 1000000);
-}
-
-// Return true if time1 is before time2.  Always use this function to
-// compare times as regular C comparisons can fail if the counter
-// rolls over.
-uint8_t
-timer_is_before(uint32_t time1, uint32_t time2)
-{
-    return (int32_t)(time1 - time2) < 0;
 }
 
 // Return the current time (in clock ticks)
@@ -115,16 +104,10 @@ uint32_t
 timer_read_time(void)
 {
     uint32_t t = timespec_to_time(timespec_read());
-    TimerInfo.last_read_time = t;
+    last_read_time = t;
     return t;
 }
 
-// Activate timer dispatch as soon as possible
-void
-timer_kick(void)
-{
-    timer_dispatch();
-}
 
 #define TIMER_IDLE_REPEAT_COUNT 100
 #define TIMER_REPEAT_COUNT 20
@@ -140,7 +123,7 @@ timer_dispatch(void)
         next = timer_dispatch_many();
 
         repeat_count--;
-        uint32_t lrt = TimerInfo.last_read_time;
+        uint32_t lrt = last_read_time;
         if (!timer_is_before(lrt, next) && repeat_count)
             // Can run next timer without overhead of calling timer_read_time()
             continue;
@@ -165,9 +148,54 @@ timer_dispatch(void)
             diff = next - timer_read_time();
     }
 
-    // Update next wake time for simulation
-    TimerInfo.next_wake_counter = next;
-    TimerInfo.must_wake_timers = 0;
+    // Update next wake time and schedule libevent timer
+    next_wake_counter = next;
+    must_wake_timers = 0;
+    
+    // Schedule the next libevent timer
+    if (event_base && timer_event) {
+        struct timespec next_ts = timespec_from_time(next);
+        struct timeval timeout = timespec_to_timeval(next_ts);
+        struct timeval now_tv;
+        gettimeofday(&now_tv, NULL);
+        
+        // Calculate relative timeout
+        if (timeout.tv_sec > now_tv.tv_sec || 
+            (timeout.tv_sec == now_tv.tv_sec && timeout.tv_usec > now_tv.tv_usec)) {
+            timeout.tv_sec -= now_tv.tv_sec;
+            if (timeout.tv_usec < now_tv.tv_usec) {
+                timeout.tv_sec--;
+                timeout.tv_usec += 1000000;
+            }
+            timeout.tv_usec -= now_tv.tv_usec;
+        } else {
+            // Timer is already due, schedule immediately
+            timeout.tv_sec = 0;
+            timeout.tv_usec = 1;
+        }
+        
+        evtimer_add(timer_event, &timeout);
+    }
+}
+
+// Activate timer dispatch as soon as possible
+void
+timer_kick(void)
+{
+    timer_dispatch();
+}
+
+// Callback function for libevent timer
+static void
+timer_callback(evutil_socket_t fd, short what, void *arg)
+{
+    (void)fd;
+    (void)what;
+    (void)arg;
+    
+    if (must_wake_timers) {
+        timer_dispatch();
+    }
 }
 
 void
@@ -175,15 +203,45 @@ timer_init(void)
 {
     // Initialize timespec_to_time() and timespec_from_time()
     struct timespec curtime = timespec_read();
-    TimerInfo.start_sec = curtime.tv_sec + 1;
-    TimerInfo.next_wake = curtime;
-    TimerInfo.next_wake_counter = timespec_to_time(curtime);
-    TimerInfo.must_wake_timers = 1;
+    start_sec = curtime.tv_sec + 1;
+    next_wake = curtime;
+    next_wake_counter = timespec_to_time(curtime);
+    must_wake_timers = 1;
+    
+    // Initialize libevent
+    event_base = event_base_new();
+    if (!event_base) {
+        try_shutdown("Failed to create libevent base");
+        return;
+    }
+    
+    // Create timer event
+    timer_event = evtimer_new(event_base, timer_callback, NULL);
+    if (!timer_event) {
+        event_base_free(event_base);
+        event_base = NULL;
+        try_shutdown("Failed to create libevent timer");
+        return;
+    }
     
     timer_kick();
 }
 DECL_INIT(timer_init);
 
+// Cleanup function for shutdown
+void
+timer_cleanup(void)
+{
+    if (timer_event) {
+        event_free(timer_event);
+        timer_event = NULL;
+    }
+    
+    if (event_base) {
+        event_base_free(event_base);
+        event_base = NULL;
+    }
+}
 
 /****************************************************************
  * Interrupt wrappers
@@ -213,17 +271,10 @@ irq_restore(irqstatus_t flag)
 void
 irq_wait(void)
 {
-    // Sleep briefly to prevent excessive cpu usage in simulator
-    // but still maintain responsive timing
-    if (!TimerInfo.must_wake_timers) {
-        usleep(1);
-    }
-    irq_poll();
+    event_base_loop(event_base, EVLOOP_ONCE | EVLOOP_NONBLOCK);
 }
 
 void
 irq_poll(void)
 {
-    if (TimerInfo.must_wake_timers)
-        timer_dispatch();
 }
